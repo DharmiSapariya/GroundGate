@@ -2,401 +2,452 @@
 
 # GroundGate
 
-### Check an agent's facts before it acts.
+### Check an agent's facts before it acts, and make the database itself refuse the action if the facts changed.
 
-**Perceptron Hackathon 2026** · IITB-Optiver AI Innovation Lab · Techfest, IIT Bombay
-**Round 1 submission** · Theme 6 (AI You Can Actually Trust) · Problem 9
+**Perceptron Hackathon 2026** · IITB × Optiver AI Innovation Lab · Techfest, IIT Bombay · Theme 6, Problem 9: *Catching an Agent Before It Acts on a Bad Idea*
 
-![Team](https://img.shields.io/badge/Team-Neural%20Genesis-1f3a5f)
-![Team ID](https://img.shields.io/badge/Team%20ID-TM--1EFBCA97D27-1f3a5f)
-![Round](https://img.shields.io/badge/Round-1%20(abstract)-orange)
-![Problem](https://img.shields.io/badge/Problem-9%20Catching%20an%20Agent%20Before%20It%20Acts-blue)
-![Benchmarks](https://img.shields.io/badge/benchmark%20numbers-synthetic-lightgrey)
+![python](https://img.shields.io/badge/python-3.10%2B-1f3a68) ![core deps](https://img.shields.io/badge/core%20dependencies-none-1d7a4a) ![tests](https://img.shields.io/badge/tests-120%20passing-1d7a4a) ![held-out](https://img.shields.io/badge/held--out%20v1-0%2F31%20harmful%20executed-1d7a4a) ![agent](https://img.shields.io/badge/LangGraph%20agent-built%2C%20real--model%20run%20pending-a8650b) ![evidence](https://img.shields.io/badge/evidence-synthetic%20%2B%20frozen%20scenarios-a8650b)
 
-[Abstract (PDF)](assets/GroundGate_Abstract.pdf) · [The problem](#-the-problem) · [Architecture](#-architecture) · [Evaluation](#-evaluation) · [Roadmap](#-roadmap) · [Round 1 checklist](#-round-1-checklist)
+[**Try the playground**](docs/index.html) · [Architecture and flows](docs/ARCHITECTURE.md) · [Results](#results) · [Run it](#run-it) · [Agent harness](#langgraph-agent-harness) · [Honest limits](#what-is-not-done) · [Roadmap](#roadmap)
 
-<img src="https://github.com/DharmiSapariya/GroundGate/blob/main/GroundGate-System%20Architecture.jpeg" alt="GroundGate system architecture" width="900">
+<img src="docs/assets/architecture.png" alt="GroundGate architecture: untrusted agent, trusted gate and executor, cache, system of record, audit log" width="470">
 
 </div>
 
+> **No install needed to explore:** open [`docs/index.html`](docs/index.html) (or enable GitHub Pages on `/docs`). It replays 246 scenarios recorded from the real gate and executor. Pick an agent request, corrupt the evidence, and watch each stage decide.
+
 ---
 
-## 📌 TL;DR
-
-Most agent guardrails ask **"is the agent allowed to do this?"** GroundGate asks **"is what the agent believes actually true?"**
-
-It sits between an LLM agent and its mutating tools (refund, cancel, change address). Before any call runs, it checks the call's premises against a system of record, pays for authoritative lookups only when they are worth it, and re-checks at commit time inside the executor so a stale verdict cannot be acted on.
+## At a glance
 
 | | |
 |---|---|
-| **Problem** | Problem 9, *Catching an Agent Before It Acts on a Bad Idea* |
-| **Core idea** | Three-valued verdicts (SUPPORTED / CONTRADICTED / UNVERIFIABLE) plus a budgeted verification cascade plus a commit-time recheck |
-| **Stack** | Python standard library gate · SQLite system of record · LangGraph agent (planned) |
-| **Needs** | No paid APIs, no GPU for the core |
-| **Honest caveat** | All benchmark numbers come from synthetic worlds, not real model errors |
+| **The idea** | Most guardrails ask *"may the agent do this?"* GroundGate asks *"is what the agent believes true?"* and enforces the answer at the write. |
+| **How** | Typed action → evidence cascade (cache, then one bounded lookup) → three-valued verdicts → risk-aware decision → protected executor that rechecks inside the transaction. |
+| **Stack** | Python standard library · SQLite system of record · optional LangGraph agent with a local model |
+| **Held-out v1** (51 cases, frozen by hash before its first run) | GroundGate executed **0 of 31** harmful actions and completed **18 of 20** valid ones |
+| **Where it is weak** | A fresh-but-wrong cache lets a *low-value* action past the gate (the executor stops it). Valid-but-unintended actions execute. Evidence is synthetic; no natural model errors measured yet. |
+| **Tests** | 120 automated tests, about 10 s |
 
----
+## The problem
 
-## 🚦 Status
-
-<details open>
-<summary><b>What is built, and what is not (click to collapse)</b></summary>
-
-| Component | Status |
-|---|---|
-| Typed action record and premise extraction | ✅ Built, tested |
-| Evidence resolution (source, authority, freshness) | ✅ Built, tested |
-| Verification cascade (exact, cache, one budgeted lookup) | ✅ Built, tested |
-| Risk-table policy (block / escalate / allow) | ✅ Built, tested |
-| Execution barrier (token, idempotency, `BEGIN IMMEDIATE` recheck) | ✅ Built, tested |
-| Synthetic evaluation harness (20 worlds × 500 actions × 8 conditions) | ✅ Built |
-| Automated tests: unit, security, multi-process race, benchmark integrity | ✅ 81 passing |
-| LangGraph agent calling the gate | 🔜 Planned (by 9 Nov) |
-| Real-LLM run on about 120 constructed scenarios | 🔜 Planned |
-| LLM-judge tier for UNVERIFIABLE high-risk calls | 🔜 Planned (stretch) |
-| Red-team suite, 60 to 100 cases | 🔜 Planned (stretch) |
-| Executor view that lags the system of record | 🔜 Planned |
-
-</details>
-
-> **Repository note.** This repository currently holds the Round 1 submission material (abstract and diagrams). The prototype source and benchmark scripts are not in it yet.
-
----
-
-## 🎯 The problem
-
-The costliest agent error is often a **permitted, well-formed call resting on a false fact**: a refund for an order that does not exist, belongs to another customer, or was already refunded. Nothing errors, so nothing flags it.
+An agent calls `refund_order(ORD-1001, C1, 12000)`. The call is well-formed. The agent has permission. The code will run it. And it is still wrong, because the order doesn't exist, belongs to someone else, or was already refunded. Permission checks and schema validation never look at that.
 
 ```mermaid
 sequenceDiagram
-    autonumber
-    participant A as Agent (untrusted)
-    participant P as Permission layer
-    participant T as Refund tool
-    participant D as System of record
-    A->>P: refund(order=ORD-9917, amount=4200)
-    P->>P: Is the agent allowed to call refund? Yes
-    P->>T: Execute
-    T->>D: Pay out
-    Note over D: ORD-9917 was already refunded<br/>(or never existed, or is someone else's)
-    D-->>A: Success. Money is gone.
+  autonumber
+  participant A as Agent (untrusted)
+  participant P as Permission layer
+  participant T as Refund tool
+  participant D as System of record
+  A->>P: refund(order=ORD-9917, amount=4200)
+  P->>P: Is the agent allowed to call refund? Yes
+  P->>T: Execute
+  T->>D: Pay out
+  Note over D: ORD-9917 was already refunded<br/>(or never existed, or is someone else's)
+  D-->>A: Success. The money is gone.
 ```
 
-Permission layers such as AgentSpec, Progent and CaMeL decide whether the agent may act. They do not check whether its facts are true. That is the gap GroundGate targets.
+Checking the fact sounds easy: look it up. The difficulty is everything around the lookup:
 
----
+| Real-world condition | The tempting mistake | What GroundGate does |
+|---|---|---|
+| The cache has no entry for the order | treat "not in cache" as "doesn't exist" and block valid work | `UNVERIFIABLE`, never `CONTRADICTED` |
+| The cache has an entry, but it is old | trust it | a stale entry supports nothing |
+| The authoritative source times out | treat "couldn't check" as "checked, fine" | irreversible actions escalate; nothing runs on an unanswered question |
+| Every lookup costs time and money | always query, whatever the stakes | one bounded lookup, routed by risk tier |
+| The order changes after the check, before the write | assume the check still holds | the executor rechecks **inside** the write transaction |
 
-## 🧩 Why it is hard
-
-<details>
-<summary><b>1. Absence is not contradiction</b></summary>
-
-A cache that lacks an order has not shown the order is fake. If the guard blocks on absence, it produces false blocks. If it trusts stale entries, it produces wrong executions. GroundGate therefore keeps **UNVERIFIABLE** separate from **CONTRADICTED**.
-
-</details>
-
-<details>
-<summary><b>2. Verification costs something</b></summary>
-
-Each authoritative lookup adds latency and spends budget. The guard has to decide when a lookup is worth paying for, which is why GroundGate counts lookups per action and caps them.
-
-</details>
-
-<details>
-<summary><b>3. Verdicts go stale</b></summary>
-
-State can change between the check and the write. Retries and concurrent requests must not act twice. GroundGate rechecks inside the executor, in the same transaction as the write.
-
-</details>
-
----
-
-## 🏗 Architecture
-
-> Trust boundary: the agent's output is untrusted. Only the executor and the system of record are trusted. Same-OS-privilege attackers are out of scope.
+## How it works
 
 ```mermaid
 flowchart LR
-    A["Agent<br/>(untrusted, LangGraph planned)"] --> R1
-    subgraph TRUSTED["Trusted side"]
-        direction LR
-        R1["1. Typed action record<br/>args, reversibility, amount,<br/>idempotency key, premises"] --> R2
-        R2["2. Evidence resolution<br/>source, authority, freshness<br/>free text is never evidence"] --> R3
-        R3["3. Verification cascade<br/>exact checks, then cache,<br/>then at most 1 lookup"] --> R4
-        R4{"4. Risk-table policy"}
-        ES[("Evidence sources<br/>cache (incomplete, stale)<br/>SQLite system of record")] -. lookup .-> R3
-        R4 -- CONTRADICTED --> BLK["BLOCK"]
-        R4 -- UNVERIFIABLE --> ESC["ESCALATE or LOG"]
-        R4 -- SUPPORTED --> TOK["Action-bound token<br/>expiring, single-use"]
-        ESC -. "low risk: allow + log" .-> TOK
-        TOK --> R5["5. Execution barrier<br/>re-derive, recheck,<br/>version-conditional update"]
-    end
-    R5 --> H["Evaluation harness<br/>20 worlds x 500 actions x 8 conditions"]
-
-    classDef untrusted fill:#f8d7d3,stroke:#1f3a5f,color:#000;
-    classDef gate fill:#dde8f6,stroke:#1f3a5f,color:#000;
-    classDef policy fill:#fff0d3,stroke:#1f3a5f,color:#000;
-    classDef exec fill:#e3dff2,stroke:#1f3a5f,color:#000;
-    classDef bad fill:#f5dcd6,stroke:#a33,color:#000;
-    class A untrusted
-    class R1,R2,R3 gate
-    class R4,ESC,TOK policy
-    class R5 exec
-    class BLK bad
+  AG["Agent<br/>(LLM or script)<br/>UNTRUSTED"] -- "JSON tool call" --> IR
+  subgraph TRUST["Trusted process: key, tokens and DB write handle never reach the agent"]
+    direction LR
+    IR["1 Typed action<br/>validate, derive premises"] --> CV["2 Evidence cascade<br/>cache, then one lookup"]
+    CV --> VD["3 Verdict per premise<br/>SUPPORTED / CONTRADICTED / UNVERIFIABLE"]
+    VD --> PL["4 Risk-aware decision<br/>ALLOW / BLOCK / ESCALATE"]
+    PL -- "ALLOW: single-use token" --> EX["5 Protected executor<br/>token check + atomic recheck"]
+  end
+  CV -.-> CA[("Cache<br/>incomplete, may be stale")]
+  CV --> SR[("System of record<br/>read-only for the verifier")]
+  EX --> WR[("System of record<br/>write path: executor only")]
+  PL -- "BLOCK / ESCALATE + reason" --> AG
+  classDef bad fill:#f8e3df,stroke:#b83a2b,color:#1c2430
+  classDef ok fill:#e4f3ea,stroke:#1d7a4a,color:#1c2430
+  classDef core fill:#e3ebf8,stroke:#1f3a68,color:#1c2430
+  class AG bad
+  class SR,WR ok
+  class IR,CV,VD,PL,EX core
 ```
 
-### The five stages
+1. **Typed action.** Each tool (`refund_order`, `cancel_order`, `update_address`) has a schema. The gate validates arguments and derives the *premises* itself, from the schema and not from the agent's explanation. A refund rests on four: the order exists, it belongs to this customer, its status allows a refund, and the amount fits what's left.
+2. **Evidence cascade.** Cache first. At most one read-only lookup of the system of record, and only when the action's risk calls for it. Authoritative evidence outranks cache; disagreements are logged.
+3. **Three-valued verdicts.** `SUPPORTED`, `CONTRADICTED` or `UNVERIFIABLE`. Missing or stale evidence is `UNVERIFIABLE`, never `CONTRADICTED`.
+4. **Risk-aware decision.** The verdict and the risk tier decide the outcome (below).
+5. **Protected executor.** The only code that can write. It needs a single-use, expiring, action-bound token, re-derives the premises itself, and rechecks them in one transaction.
 
-<details>
-<summary><b>1 · Typed action record</b></summary>
+> **Deep dive:** [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) has 16 diagrams: trust boundaries, component map, request lifecycle, evidence cascade, breaker state machine, token anatomy, executor check order, data model, every failure flow, LangGraph integration and the evaluation pipeline.
 
-Validated arguments, reversibility, amount, an idempotency key, and the **premises** the call depends on: the order exists, belongs to this customer, its status allows the action, and it has not already been refunded.
-
-</details>
-
-<details>
-<summary><b>2 · Evidence resolution</b></summary>
-
-Every observation carries its **source**, **authority** and **freshness**.
-
-- Authoritative data beats cache.
-- Stale entries never support irreversible actions.
-- Free text is never evidence.
-
-Each premise then resolves to one of three verdicts.
+### From verdict to decision
 
 ```mermaid
-stateDiagram-v2
-    [*] --> UNVERIFIABLE: no usable evidence yet
-    UNVERIFIABLE --> SUPPORTED: fresh evidence agrees
-    UNVERIFIABLE --> CONTRADICTED: authoritative evidence disagrees
-    SUPPORTED --> CONTRADICTED: authoritative source disagrees
-    SUPPORTED --> [*]
-    CONTRADICTED --> [*]
-    note right of UNVERIFIABLE
-        A missing cache entry lands here,
-        not in CONTRADICTED. Stale entries
-        stay here for irreversible actions.
-    end note
+flowchart LR
+  V{"Verdict"}
+  V -- CONTRADICTED --> B1["BLOCK"]
+  V -- SUPPORTED --> A1["ALLOW<br/>token issued"]
+  V -- UNVERIFIABLE --> R{"Reversible action?"}
+  R -- yes --> A2["ALLOW with log<br/>commit-time recheck still applies"]
+  R -- no --> Q{"Escalation budget left?"}
+  Q -- yes --> E1["ESCALATE<br/>nothing executes"]
+  Q -- no --> B2["BLOCK"]
+  classDef b fill:#f8e3df,stroke:#b83a2b,color:#1c2430
+  classDef a fill:#e4f3ea,stroke:#1d7a4a,color:#1c2430
+  classDef e fill:#fbf0d9,stroke:#a8650b,color:#1c2430
+  class B1,B2 b
+  class A1,A2 a
+  class E1 e
 ```
 
-</details>
+**Risk tiers.** An irreversible action at or above `HIGH_AMOUNT_CENTS` (5000 in `model.py`; the benchmark freezes 2500 on its dev seeds) is *high risk* and needs authoritative support. Cancel has no amount, so it is always high. Reversible or small actions may rest on a fresh cache. The costs behind the policy (harm 50, false block 1, escalation 5, lookup 0.1) are assumptions.
 
-<details>
-<summary><b>3 · Verification cascade</b></summary>
-
-Exact checks, then the cache, then **at most one** read-only authoritative lookup, under a budget, a timeout and a circuit breaker. Lookups per action are counted so policies can be compared at an equal budget.
-
-</details>
-
-<details>
-<summary><b>4 · Risk-table policy</b></summary>
-
-A transparent rule table with assumed costs. It is not a calibrated model.
-
-| Premise verdict | Action is irreversible or high value | Action is reversible and low value |
-|---|---|---|
-| **CONTRADICTED** | Block | Block |
-| **SUPPORTED** | Allow | Allow |
-| **UNVERIFIABLE** | Escalate | Allow and log |
-
-</details>
-
-<details>
-<summary><b>5 · Execution barrier (protected executor)</b></summary>
-
-The executor accepts only `(tool, args, request_id)`. It re-derives premises, risk and the idempotency key itself, requires an expiring single-use token bound to the action, then rechecks the premises and applies a version-conditional update inside one `BEGIN IMMEDIATE` transaction. A duplicate or racing request aborts, and every decision goes into a hash-chained audit log.
+### The execution barrier
 
 ```mermaid
 sequenceDiagram
-    autonumber
-    participant G as Gate
-    participant E as Executor
-    participant D as System of record
-    G->>E: (tool, args, request_id) + token
-    E->>E: Re-derive premises, risk, idempotency key
-    E->>E: Verify token (expiring, single-use, action-bound)
-    E->>D: BEGIN IMMEDIATE
-    E->>D: Recheck premises at mutation time
-    alt premises still hold and version matches
-        E->>D: Version-conditional update
-        E->>D: COMMIT
-        E-->>G: executed
-    else stale, duplicate, or racing request
-        E->>D: ROLLBACK
-        E-->>G: aborted (audit logged)
-    end
+  autonumber
+  participant A as Agent
+  participant G as Gate
+  participant S as System of record (read-only)
+  participant X as Protected executor
+  participant D as Database (write)
+  A->>G: refund_order(ORD-1001, C1, 12000)
+  G->>S: one bounded read-only lookup
+  S-->>G: row at version 4
+  G->>G: premises SUPPORTED on authoritative evidence
+  G->>G: write audit record, then mint token
+  G->>X: action + token (HMAC, 60 s expiry, nonce, version)
+  X->>X: verify token, re-derive premises itself
+  X->>D: BEGIN IMMEDIATE
+  X->>D: re-read row, re-check every premise
+  X->>D: UPDATE ... WHERE version = 4
+  X->>D: INSERT idempotency key and used-token nonce
+  X->>D: COMMIT
+  X-->>A: EXECUTED
 ```
 
+<details><summary><b>What happens when things go wrong</b></summary>
+
+| # | Situation | What happens | Result | Evidence in the repo |
+|---|---|---|---|---|
+| 1 | **Evidence is stale** | A stale cache entry can't support any premise. The gate falls through to the authoritative lookup. A high-risk action never rests on cache at all. | If the source agrees: allowed. If not: blocked. | `test06_stale_cache_not_trusted`, red-team X07 |
+| 2 | **Authoritative source times out** | Premises stay `UNVERIFIABLE`. Irreversible action → `ESCALATE` (or `BLOCK` once the escalation budget is spent). Reversible action → allowed *with a log*, and the executor still rechecks. The breaker opens after 3 faults. | Nothing irreversible runs on an unanswered question. | `test09`, `test10`, `test10b`, red-team X10, X11 |
+| 3 | **The record changes after verification** | The executor re-reads the row **inside** `BEGIN IMMEDIATE`, re-evaluates every premise, and uses a version-conditional `UPDATE`. Optional `strict_version` also aborts if the version moved. | `ABORTED_PRECONDITION`, nothing written. | `test16b_stale_cache_low_risk_caught_at_commit`, scenarios D01–D02, X09, X17, X18 |
+| 4 | **An action token is reused** | The token is an HMAC over action, decision, expiry, nonce and row version. Changed arguments break the HMAC; expiry is 60 s; the nonce goes into `used_tokens` in the same transaction. Retrying the same action returns `DUPLICATE`; reusing a request id for a different action returns `IDEMPOTENCY_CONFLICT`. | `TOKEN_REPLAYED`, `DUPLICATE` or a bypass error. Never a second write. | `test_token_nonce_single_use_even_if_idempotency_row_lost`, X12–X16 |
+| 5 | **An external API succeeds but the local system fails to record it** | See below. | Not solved by the database. | `benchmarks/external_effects.py` (simulation only) |
+
+### Case 5, stated plainly
+
+A local SQLite transaction **cannot** be atomic with a call to an external payment API. If the API charges the refund and the process dies before the local `COMMIT`, the two systems disagree, and no amount of local locking fixes that. The executor in this repo writes only to SQLite, so it does not face this problem today; the simulation in `external_effects.py` does.
+
+| Mitigation | Status |
+|---|---|
+| Send an idempotency key with every external call, so a retry can't charge twice | **Simulated.** Blind retry duplicates 8.4% of refunds under ambiguous timeouts; idempotency keys bring it to 0.0% *when the processor honours them*. A client that sends keys to a processor that ignores them still duplicates 8.4%. |
+| Reconcile by querying the processor's ledger before any retry | **Simulated.** 0.0% duplicates, including for processors without idempotency keys. |
+| Write an *intent* row (outbox) before the call, then record the result after, so a crash leaves evidence to reconcile from | **Planned** (milestone in the roadmap). Not in the executor yet. |
+| Non-atomic recheck just before the external call | **Simulated.** Shrinks executed harm from 4.9% to 1.6% (and 0.3% with a tighter window), never to 0.0%. |
+
+Idempotency keys and reconciliation are standard payment-engineering practice. We use them; we don't claim them.
 </details>
 
-### Four state views
+## Results
 
-The benchmark keeps four views of the world separate and degrades them independently, so the gate can be tested against the failure that matters (a decision made on one view and executed against another).
+Everything here is synthetic or scenario-based; none of it is from a live system. Intervals are 95% Wilson.
 
-| View | What it is |
+### Held-out scenarios v1 (51 cases: 31 harmful, 20 valid), frozen before the first run
+
+Same runner, same labels-first rule, same gate and thresholds as on dev. The set was written without opening `src/`, was frozen by SHA-256, run once, and nothing was changed afterwards.
+
+| Arm | Harmful executed | 95% CI | Valid completed | 95% CI |
+|---|---|---|---|---|
+| no guard | 27/31 (87%) | [71, 95] | 20/20 | [84, 100] |
+| closed-world cache | 6/31 (19%) | [9, 36] | 2/20 (10%) | [3, 30] |
+| always query | 6/31 (19%) | [9, 36] | 17/20 (85%) | [64, 95] |
+| **GroundGate** | **0/31 (0%)** | [0, 11] | 18/20 (90%) | [70, 97] |
+
+* **8 of 31 harmful cases passed the gate** and were stopped only by the executor's commit-time recheck: six changed-after-check cases (`H044`–`H047`, `H050`, `H051`) and two fresh-but-wrong cache entries (`H032`, `H041`, both low-value refunds). This is the same known gate-level hole as on dev, and it reproduced on cases the gate was not tuned on.
+* **Always-query executes 6 harmful cases** for the same six changed-after-check reasons: it has no commit-time check.
+* **GroundGate's two valid misses** are `H037` and `H039`: source down, nothing cached, irreversible action, so it escalates. That is the designed cost of refusing to act on an unanswered question.
+* A zero is not proof of safety: with 31 harmful cases the upper bound is 11%. Full tables and every failure: [`results/scenarios_heldout.md`](results/scenarios_heldout.md).
+
+<details><summary><b>Realistic dev scenarios (30 cases: 17 harmful, 13 valid)</b></summary>
+
+Labels fixed in the files; outcomes from database diffs. Cases were written on the implementer side, so this is a development check, not independent evidence.
+
+| Arm | Harmful executed | 95% CI | Valid completed | 95% CI |
+|---|---|---|---|---|
+| no guard | 14/17 (82%) | [59, 94] | 13/13 | [77, 100] |
+| closed-world cache | 3/17 (18%) | [6, 41] | 0/13 | [0, 23] |
+| always query | 2/17 (12%) | [3, 34] | 11/13 (85%) | [58, 96] |
+| **GroundGate** | **0/17 (0%)** | [0, 18] | 12/13 (92%) | [67, 99] |
+
+GroundGate's *pre-commit* number is worse than its final one: **3 of 17 harmful cases passed the gate** and were stopped only by the executor's recheck (`D01`, `D02`, and `S03`, a fresh-but-wrong cache on a low-value refund). Always-query fails the same two changed-after-check cases because it has no commit-time check. The one valid case GroundGate doesn't complete is `S07`: source down, irreversible, nothing to verify against, so it escalates. Full table: [`results/scenarios_dev.md`](results/scenarios_dev.md).
+</details>
+
+### Synthetic benchmark and external-effects model
+
+20 independent worlds × 500 actions × 8 evidence conditions (cache completeness, staleness, replica lag, outage, lookup budget, drift), dev and test split.
+
+| Question | Result |
 |---|---|
-| (a) Agent-visible | What the agent believes when it proposes the call |
-| (b) Verification-time | What the gate sees when it checks |
-| (c) Verifier-visible | What the evidence source actually exposes (cache gaps, lag, outages) |
-| (d) Mutation-time | The true state at commit. **Harm labels come from this view.** |
+| Executed harm when the record changes between check and call (external API, no atomic recheck) | no guard **42.5%** → GroundGate **4.9%** → + non-atomic recheck **1.6%** → tighter window **0.3%** → atomic recheck **0.0%** |
+| Who gets the credit? | The recheck. Always-query + the same recheck also reaches 1.6%. This benefit is not specific to GroundGate. |
+| Completion under a tight lookup budget (0.2 lookups/action, condition C5) | GroundGate completes **10.6** points more valid actions than always-query (95% CI 9.8 to 11.4), with harmful passes falling from 19.5% to 10.3% |
+| Where GroundGate loses | in the external model (no atomic recheck) a *fresh-but-wrong* cache lets it execute 2.5% of harmful actions where always-query executes 0.0%; at a 0.2 lookup budget there it completes 48.2% of valid actions against 60.0%, escalating 48.6% instead |
+| Closed-world cache guard | reaches 0% harm but completes only about 60% of valid actions |
+| A learned alternative | a VOI-style policy fitted on dev data beats our hand-set tiers on expected loss at our assumed costs. We kept the transparent tiers and report the alternative. |
+| An online reliability estimator | cuts harm but costs 5 to 22 points of valid completions at cold start. Not shipped. |
+| Blind retries after ambiguous timeouts | 8.4% duplicate refunds; 0.0% with idempotency keys or reconciliation |
+| Race stress, 4 processes × 4 threads, 30 runs | executor: 0 of 30 runs with a violation (Wilson upper bound 11.4%). Naive writer: 30 of 30 runs, about 15 over-refunded orders per run. |
+| Red team | 73 builder cases + 37 extended cases, all stopped; 3 documented limits. **Not independent.** |
 
----
+Tables and CIs: [`docs/RESULTS.md`](docs/RESULTS.md), [`results/benchmark.md`](results/benchmark.md), [`results/external/EXTERNAL_RESULTS.md`](results/external/EXTERNAL_RESULTS.md).
 
-## ✅ What the Minimum Viable bar maps to
+## LangGraph agent harness
 
-| Problem 9 bullet | Our deliverable |
+> **Status: built and tested, not yet run on a real model.** The tests use a scripted stand-in and a fake HTTP endpoint. No natural-error number exists until you run it on a local model. The offline `--llm demo` output is labelled SMOKE because its faults are injected.
+
+```mermaid
+flowchart LR
+  S([START]) --> L["crm_lookup<br/>stale or incomplete CRM view"]
+  L --> P["propose<br/>local LLM -> one JSON tool call"]
+  P --> J{"parse"}
+  J -- "malformed: feedback, up to 2 retries" --> P
+  J -- "valid tool call" --> A["act<br/>GuardedActuator -> TrustedService.submit"]
+  J -- "none / gave up / LLM error" --> R["report"]
+  A --> R --> E([END])
+```
+
+* The agent never sees the system of record, only a CRM view that can be stale or missing orders. The `act` node holds only the JSON channel to the trusted child process.
+* 40 tickets (20 where the right move is *no action*), intents fixed before any run, labels derived from the **database truth**, never from a guard.
+* **Paired design:** each model proposal is judged four ways on identical state. GroundGate is the live path; no-guard, closed-world cache and always-query replay the same recorded proposal. The report adds a mistake taxonomy, a per-ticket view (runs of one ticket aren't independent), and SHA-256 of tickets and prompt.
+* Works with any OpenAI-compatible server: **Ollama**, llama.cpp, vLLM.
+
+```bash
+pip install -e .[agent]                      # adds langgraph only
+ollama pull qwen2.5:7b-instruct
+python3 agent/run_natural.py --model qwen2.5:7b-instruct --runs 3     # writes results/natural_agent/
+```
+Details and honesty rules: [`agent/README.md`](agent/README.md).
+
+## Evaluation design
+
+Most of our numbers come from synthetic worlds, and we say so. The design is meant to make that evidence hard to fool ourselves with.
+
+### Three evidence layers
+
+| Layer | What it is | Who wrote it | Status |
+|---|---|---|---|
+| **Synthetic benchmark** | 20 worlds × 500 actions, 8 evidence conditions | us, with dev and test split | run, CIs reported |
+| **Realistic scenario sets** | refunds, cancellations, wrong customer ids, already-completed refunds, stale info, changes after the check ([`scenarios/`](scenarios/README.md)) | **dev** (30): implementer. **Held-out v1** (51): written without opening `src/`, AI-assisted, frozen by hash. **v2**: a teammate, **kit built, no cases written yet** | dev and v1: run. v1 run once, reported above |
+| **Natural agent errors** | a local open-weight model calling the tools through LangGraph | the model | **harness built; real-model run not yet executed** |
+
+### Avoiding circular evaluation
+
+If the commit-time recheck decides what counts as safe, every arm that includes it looks perfect by definition. So:
+
+1. **Labels are inputs.** Authors write `valid` or `harmful` before any arm runs; no guard produces a label.
+2. **Outcomes come from the database.** "Executed" means the order row changed between a snapshot and the end of the call. Return values are ignored.
+3. **Gate and executor are reported apart.** *Harmful passed the gate* sits next to *harmful executed*. The gap is what an in-transaction recheck buys, and we don't credit it to GroundGate's routing.
+4. **Independent recomputation.** `benchmarks/verify_results.py` recomputes every summary cell from raw rows without importing the benchmark's metric code (1,440 raw rows, 1,200 cells, 0 discrepancies).
+5. **Held-out sets are frozen by SHA-256** and the runner refuses to run if they changed.
+
+<details><summary><b>Baselines, and the four state views</b></summary>
+
+| Baseline | What it represents |
 |---|---|
-| Build a checker that verifies at least one class of agent action against a source before execution | Refund calls checked against the SQLite system of record |
-| Demonstrate it catching at least one deliberately bad or hallucinated action | Demo blocks: a fabricated order ID, another customer's order, an already-refunded order, a forged token, and a hostile free-text payload. Valid refunds still pass. |
+| **no guard** | the agent's call executes as proposed |
+| **closed-world cache** | "not in cache means doesn't exist" |
+| **always query** | one authoritative lookup for every action, no routing |
+| **VOI-style budgeted re-verification** | our reimplementation, fitted on dev data (not the original authors' code) |
+| **executor-only recheck** | no pre-check; only the in-transaction recheck |
+| **fact gate** | a NOMOS-style deterministic rule gate, our reimplementation |
 
-**Stretch goals**
+<img src="docs/assets/evaluation_framework.png" alt="Evaluation framework: four state views S0, R, S1, S2" width="760">
 
-| Stretch goal | Plan | Why it is the next step |
+S0 what the agent saw · R what the verifier could see · S1 the truth at verification · S2 the truth at mutation. Harm is labelled from S2 only.
+</details>
+
+## How GroundGate differs from existing work
+
+| Existing approach | What it checks | GroundGate's distinction |
 |---|---|---|
-| Route between a fast and a careful model by risk | Rule-based routing is built (cache-only, one lookup, or escalate). Next, a slower LLM judge sees only UNVERIFIABLE high-risk calls. | The rule table already isolates exactly that set, so the judge's cost is paid only where rules cannot decide. |
-| Small red-teaming suite | 60 to 100 cases: prompt injection, forged or replayed tokens, wrong-owner IDs, races | The token, idempotency and recheck defences are what a hostile caller would target. Only adversarial cases show whether they hold outside our own synthetic worlds. |
+| **Permission-based guardrails** ([Progent](https://arxiv.org/abs/2504.11703), [AgentSpec](https://arxiv.org/abs/2503.18666)) | whether this agent may call this tool, under policy | checks the **factual premises** behind an allowed call |
+| **Policy compilation** ([NOMOS](https://arxiv.org/abs/2610.11030)) | compiles written policy into a deterministic tool-call gate | the gate's rules come from tool *schemas and the live record*; it tests what an incomplete or stale source can and can't prove |
+| **Cache-based verification** (closed-world baseline) | trusts the cache | a **missing entry is inconclusive**, never proof of absence; stale evidence can't support an irreversible action |
+| **Pre-action verification** ([Look Before You Leap](https://arxiv.org/abs/2609.12057)) | verifies a proposed action before it runs | adds **mutation-time revalidation** in the executor |
+| **Always-query systems** | query the source every time | spends a **bounded lookup budget** by risk tier, and measures the completion cost |
+| **Evidence-grounding benchmarks** ([EnvTrustBench](https://arxiv.org/abs/2605.08828)) | measure whether agents verify environment claims | a *defence* that is itself evaluated under degraded evidence |
+| **Memory-premise verification** ([AMV-Guard](https://arxiv.org/abs/2610.31446)) | which memory premises to re-verify per action, trading risk, abstention and cost | **closest neighbour.** We add the commit-time barrier and the external-effects analysis; they work on long-lived memory |
 
----
+**What we claim, and what we don't.** GroundGate's contribution is not another permission layer. It is a study of how *evidence quality, freshness, lookup budgets and state changes* affect both safety and completion of business actions, plus a small implementation that makes the write path enforce the result. We do **not** claim every mechanism is new: typed preconditions, HMAC tokens, idempotency keys and transactional rechecks are established practice, and our own results show most late-change protection comes from the recheck. The novelty is the combination, the framing and the evaluation: separating what the gate prevents from what the executor prevents, and keeping the results where GroundGate loses.
 
-## 📊 Evaluation
+*Basis:* abstracts read on 1 November 2026; a full read-through of each is on our list. Also cited in the Round 1 submission and not re-checked in this update: CaMeL (2503.18813), Reddy et al. (2607.07405), LedgerAgent (2606.20529), Zwerdling et al. (2507.16459), SafeCommit (2608.04289).
 
-**Design.** 20 synthetic worlds × 500 actions × 8 source conditions (cache gaps, staleness, replica lag, outages, lookup budgets, drift). Parameters are frozen on separate dev seeds, four error families are held out, and harm is labelled from mutation-time state.
+## What is not done
 
-**Baselines.** No guard · exact rules · closed-world cache · a fact gate reimplemented from NOMOS's described behaviour · always-query · GroundGate · three ablations.
+<details open><summary><b>Honest limits</b></summary>
 
-**Metrics.** Harmful actions passing · false blocks · escalations · valid completions · lookups per action · expected loss. 95% bootstrap intervals over worlds.
-
-### Prototype findings
-
-> ⚠️ Synthetic worlds, not real model errors.
-
-| Finding | Result |
-|---|---|
-| Lookup cost | Cache-first routing used **0.08 to 0.22 fewer lookups per action** than always-query when the source was available, at equal gate-level safety |
-| Harm at a fixed budget | At 0.2 lookups per action, harmful calls passing fell **19.5% → 10.3%** |
-| Valid work | Valid completions rose **10.6 points** (95% CI 9.8 to 11.4) |
-| Escalations | Escalations of valid actions fell **59.2% → 48.5%** (10.7 points) |
-| Residual risk | Some harm remains. Evidence quality bounds safety. |
-| Closed-world cache guard | Reaches 0% harm but completes only **61%** of valid actions |
-| Cost sensitivity | At a false-block cost of 1 the closed-world guard often wins. At a cost of 20, GroundGate wins except in the ideal condition. |
-| Races | In 30 multi-process races, naive check-then-act broke the refund invariant **30 of 30** times. The protected executor never did. |
-
-<details>
-<summary><b>How to read the race result</b></summary>
-
-The commit-time recheck reads the same state that defines the harm label, so the executor's zero-harm result is true by construction. It shows the design closes the check-to-execute gap. It does not show the gate is correct against an adversary we have not modelled, which is why the red-team suite is a stretch goal.
-
+* **Synthetic evidence.** Worlds, error rates and the loss costs are assumed. Latency is modelled (1 ms cache, 40 ms lookup), not measured.
+* **No natural agent errors measured yet.** The LangGraph agent, the OpenAI-compatible client and the 40-ticket paired runner are built and tested, but only with a *scripted* stand-in. No model weights were reachable where this was built, so the real-model run is the next step and no error rate from it is claimed. `benchmarks/agent_harness.py` is the older scripted stub.
+* **Held-out v1 is pre-registered, not independent.** Frozen before its first run and written without opening `src/`, but by the project itself with AI assistance, and its labels encode our business rules. The dev set and red-team suites were written with the code in view, so they are regression coverage, not validation. The v2 kit (`scenarios/validate_scenarios.py`, [`docs/TEAMMATE_V2_BRIEF.md`](docs/TEAMMATE_V2_BRIEF.md)) is ready, but until a teammate who has not read `src/` writes and freezes `heldout_v2`, nothing here is independent.
+* **External effects are simulated.** No real payment sandbox is connected. The outbox/intent table is not built.
+* **Known gate-level holes** (all caught by the executor, not the gate): a fresh-but-wrong cache entry passes a *low-value* action at the gate (`S03`, red-team X09); a valid but unintended action by the right customer executes (X38).
+* **Not built:** an escalation consumer (today `ESCALATE` is a verdict, not a workflow), a tamper-evident audit log (it is append-only JSONL with fsync, not hash-chained), key rotation, and OS-level separation of the trusted process (a same-user attacker is out of scope; see [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)).
+* **One domain.** Order operations. No claim about other domains.
 </details>
 
-**Planned, not done:** a real-LLM agent on about 120 constructed scenarios (reported separately), 40 to 60 human-written cases from a teammate who did not build the gate, an LLM-judge baseline, and an executor view that lags the system of record.
+## Run it
 
----
+```bash
+git clone https://github.com/DharmiSapariya/GroundGate && cd GroundGate
+python3 -m unittest discover -s tests -t .        # 120 automated tests, about 10 s (graph tests skip if langgraph is absent)
+```
+```bash
+python3 benchmarks/demo.py                         # unguarded vs guarded, in-process and process-isolated
+python3 scenarios/run_scenarios.py --split dev     # 30 dev scenarios, 4 arms, CIs and failures
+python3 scenarios/run_scenarios.py --split heldout # 51 frozen held-out scenarios (refuses to run if files changed)
+python3 redteam/redteam_extended.py                # 37 extended attack cases
+python3 redteam/redteam_builder.py                 # 73 builder attack cases
+python3 benchmarks/external_effects.py             # external-API model: late changes, ambiguous timeouts
+python3 benchmarks/agent_harness.py                # older scripted agent stub (no LLM)
+python3 benchmarks/verify_results.py               # independent recomputation of the benchmark tables
+python3 tools/make_playground_data.py              # rebuild docs/index.html from the real gate
+python3 scenarios/validate_scenarios.py scenarios/heldout/heldout_v1.json --split heldout   # protocol check for any held-out file
+python3 agent/run_natural.py --llm demo --runs 1   # LangGraph pipeline smoke test with a SCRIPTED stand-in (needs langgraph; not a model)
+python3 agent/run_natural.py --model qwen2.5:7b-instruct --runs 3   # the real run: Ollama on localhost:11434, writes results/natural_agent/
+```
+The full benchmark (`python3 benchmarks/benchmark.py`, then `python3 benchmarks/report.py`) takes about four minutes. Python 3.10+; the core needs nothing installed. The agent needs `pip install -e .[agent]` (adds `langgraph`) and a local OpenAI-compatible server such as Ollama; see [`agent/README.md`](agent/README.md).
 
-## 🔬 Novelty and related work
+<details><summary><b>What the demo prints</b></summary>
 
-The obvious baseline from the Starter Resources is a LangGraph agent that looks up a knowledge base and then acts. GroundGate differs in three ways:
+```
+=== WITHOUT GUARD (agent calls the mutation directly) ===
+valid refund               -> rows changed: 1
+fabricated order ID        -> rows changed: 0
+real ID, other customer    -> rows changed: 1      <- wrong-customer refund executed
 
-1. **UNVERIFIABLE is kept distinct from CONTRADICTED.**
-2. **Lookups are spent under an explicit budget.**
-3. **The executor rechecks at commit time** instead of trusting the earlier verdict.
+=== WITH GROUNDGATE (in-process) ===
+valid refund               -> ALLOW    verdict=SUPPORTED     exec=EXECUTED
+fabricated order ID        -> BLOCK    verdict=CONTRADICTED  exec=not executed
+real ID, other customer    -> BLOCK    verdict=CONTRADICTED  exec=not executed
+Direct bypass attempt (no token): GateBypassError: mutation requires a valid ALLOW token from the gate
 
-We do not claim any single component is new.
+=== PROCESS-ISOLATED SERVICE ===
+forged token + stripped premises + fake ALLOW  -> BLOCK (premise contradicted)
+re-submit after the order is fully refunded    -> BLOCK (premise contradicted)
+garbage bytes / pickle payload                  -> BLOCK
+```
+</details>
 
-| Work | Relation |
+### Use it from an agent
+
+```python
+from groundgate.service import TrustedService
+
+svc = TrustedService("orders.db", audit_path="audit.jsonl", actor="C1").start()
+print(svc.submit("refund_order", {"order_id": "ORD-1001", "customer_id": "C1", "amount_cents": 12000}, "req-42"))
+# {'decision': 'ALLOW', 'verdict': 'SUPPORTED', 'status': 'EXECUTED', ...}
+svc.stop()
+```
+The agent side sees only JSON. The HMAC key, tokens and the write connection live in the child process. In `agent/graph.py` the LangGraph `act` node is exactly that call, and a failed model call, a malformed reply or an unreachable service all end without an action.
+
+## Repo map
+
+```
+src/groundgate/     gate.py (cascade, policy, tokens, executor) · model.py (typed actions, premises)
+                    sources.py (cache, read-only source, breaker) · service.py (process-isolated service)
+agent/              LangGraph agent, OpenAI-compatible client, 40 tickets, paired natural-error runner (optional extra)
+scenarios/          30 dev cases, 51 frozen held-out cases (+ FROZEN.sha256), runner, validator, heldout_v2/ kit
+benchmarks/         synthetic benchmark, external-effects model, concurrency stress, demo, agent stub
+redteam/            73 builder + 37 extended attack cases
+tests/              120 tests (core, security, boundary, service, scenarios, agent, v2 kit, docs consistency)
+results/            every number quoted here, as JSON and Markdown
+docs/               ARCHITECTURE · THREAT_MODEL · ALGORITHM_DESIGN · EVALUATION_PROTOCOL · RESULTS · TEAMMATE_V2_BRIEF · index.html (playground)
+docs/assets/        architecture and evaluation diagrams (PNG)
+submission/         abstract PDF and its source
+```
+
+| Doc | What is in it |
 |---|---|
-| AgentSpec (2503.18666), Progent (2504.11703), CaMeL (2503.18813) | Permission and policy layers: whether the agent may act. Complementary. |
-| Reddy et al. (2607.07405), LedgerAgent (2606.20529), NOMOS (2610.11030) | Deterministic state gates |
-| Zwerdling et al. (2507.16459, EMNLP 2025 Industry) | Policy-compiled guards |
-| **AMV-Guard (2610.31446, concurrent)** | Closest work. Picks which memory premises to re-verify by bounded value of information. |
-| **SafeCommit (2608.04289)** | Closest work. Another budgeted-verification design. |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | all diagrams and flows, component map, failure paths |
+| [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) | assets, attackers, what is in and out of scope |
+| [`docs/ALGORITHM_DESIGN.md`](docs/ALGORITHM_DESIGN.md) | cascade, policy and costs in detail |
+| [`docs/EVALUATION_PROTOCOL.md`](docs/EVALUATION_PROTOCOL.md) | evaluation rules, incl. the real-model protocol |
+| [`docs/RESULTS.md`](docs/RESULTS.md) | benchmark tables and intervals |
+| [`scenarios/README.md`](scenarios/README.md) | scenario format, authoring protocol, v2 workflow |
+| [`agent/README.md`](agent/README.md) | running the LangGraph agent on a local model |
 
-We work in a different setting (a system of record behind a degrading cache), use a transparent rule table, and do not claim to beat either. **Our contribution is the evaluation:** business-API gating with four separated state views while the evidence source degrades, policies compared at an equal lookup budget, and a report of where simple baselines win.
+## Hackathon mapping
 
----
+| Problem 9 asks for | Where it lives |
+|---|---|
+| A checker that verifies at least one class of agent action against a source before execution | refund, cancel and address calls checked against the SQLite system of record |
+| Catching a deliberately bad or hallucinated action | fabricated order ids, other customers' orders, already-refunded orders, forged tokens and hostile payloads are blocked while valid actions pass (`benchmarks/demo.py`, the playground, 110 attack cases) |
+| *Stretch:* route between fast and careful checks by risk | risk-tier routing (cache-only, one lookup, or escalate) is built and evaluated; an optional LLM tier hook exists that can only downgrade a verdict, off by default and not evaluated |
+| *Stretch:* a small red-team suite | 110 attack cases (73 builder + 37 extended), not independent |
 
-## 🗓 Roadmap
+## Roadmap
 
 ```mermaid
 gantt
-    title GroundGate plan to the finals
-    dateFormat  YYYY-MM-DD
-    axisFormat  %d %b
-    section Build
-    LangGraph agent calls the gate        :a1, 2026-11-01, 2026-11-09
-    MVP demo                               :a2, 2026-11-10, 2026-11-20
-    section Evidence
-    Elicit real model errors               :b1, 2026-11-21, 2026-11-30
-    Midway report (due 1 Dec)              :milestone, m1, 2026-12-01, 0d
-    section Stretch and polish
-    LLM judge, red-team suite, rehearsal   :c1, 2026-12-01, 2026-12-14
-    Finals at Techfest, IIT Bombay         :milestone, m2, 2026-12-15, 0d
+  title From Round 1 to the finals
+  dateFormat YYYY-MM-DD
+  axisFormat %d %b
+  section Evidence
+  Held-out v2 by a teammate, frozen by hash        :a1, 2026-11-02, 2026-11-15
+  Run v2 once, report every failure                :a2, 2026-11-16, 2026-11-20
+  section Natural agent errors
+  Run the built LangGraph harness on a local model :b1, 2026-11-02, 2026-11-08
+  120+ logged natural tool calls, error taxonomy   :b2, 2026-11-08, 2026-11-14
+  section Engine
+  Escalation queue and hash-chained audit log      :c1, 2026-11-16, 2026-11-28
+  Outbox and reconciliation vs payment sandbox     :c2, 2026-11-28, 2026-12-08
+  section Milestones
+  Shortlist announced                              :milestone, m1, 2026-11-10, 0d
+  Midway report due                                :milestone, m2, 2026-12-01, 0d
+  Demo rehearsal and final tables                  :d1, 2026-12-08, 2026-12-14
+  Finals at IIT Bombay                             :crit, d2, 2026-12-15, 4d
 ```
 
-| Date | Event |
+If time runs short, the outbox goes first; the agent run and held-out v2 stay, because those are the evidence a reviewer asks about.
+
+| What is built today | Planned for the finals |
 |---|---|
-| 31 Oct | Round 1 submission deadline |
-| 10 Nov | Shortlist announcement |
-| 1 Dec | Midway check (1-page progress report) |
-| 15 to 18 Dec | Finals, Techfest, IIT Bombay |
+| gate, evidence cascade, tokens, protected executor | escalation queue consumer; hash-chained audit log |
+| 30 dev + 51 frozen held-out scenarios, 110 attack cases, v2 kit | **held-out v2 written by a teammate**, to make the evidence independent |
+| LangGraph agent, local-model client, 40-ticket paired runner (scripted-model tested) | **run on a local open-weight model**: 40 tickets × 3 runs = 120 logged calls per model |
+| external-API *simulation* (retries, late changes) | **outbox/intent table plus reconciliation against a payment-processor sandbox or mock ledger** |
 
----
+## Team
 
-## ⚠️ Risks
+**Team Neural Genesis** · Techfest ID `TM-1EFBCA97D27`
 
-| Risk | How we handle it |
-|---|---|
-| Real model errors may be too rare to measure | Report that as it is |
-| Synthetic benchmarks can be circular | Stated openly. Harm is labelled from mutation-time state, and the human-written cases are written by someone who did not build the gate. |
-| Ranking depends on assumed costs | Show the cost sweep, not a single point |
-| Scope growth | Stretch items drop first |
+| Member | Technical skills | Owns |
+|---|---|---|
+| **Dharmi Sandip Sapariya** | DBMS, applied statistics, machine learning | **verification engine and protected executor** (`src/`), transaction and idempotency logic, bootstrap and Wilson statistics, red-team and unit tests |
+| **Mouktika Jakkam** (team leader) | Python, LLM-agent tooling (LangGraph, local open-weight models), scenario design, technical writing | **agent integration** (through the JSON service only), **held-out v2 scenarios** (a teammate who never opens `src/`), documentation and demo |
 
----
+## References
 
-## 📋 Round 1 checklist
+Checked against their arXiv pages on 1 November 2026.
 
-Where each section the organisers asked for lives in this repo.
+1. *When Is a Memory Safe Enough to Act On? Action-Conditioned Verification for Long-Lived Agents* (AMV-Guard). [arXiv:2610.31446](https://arxiv.org/abs/2610.31446)
+2. *NOMOS: Compiling Written Policies into Statically Verified Tool-Call Gates for LLM Agents.* [arXiv:2610.11030](https://arxiv.org/abs/2610.11030)
+3. *Look Before You Leap: Pre-Action Verification for LLM Agents.* [arXiv:2609.12057](https://arxiv.org/abs/2609.12057)
+4. *When Agents Overtrust Environmental Evidence* (EnvTrustBench). [arXiv:2605.08828](https://arxiv.org/abs/2605.08828)
+5. *Progent: Programmable Privilege Control for LLM Agents.* [arXiv:2504.11703](https://arxiv.org/abs/2504.11703)
+6. *AgentSpec: Customizable Runtime Enforcement for Safe and Reliable LLM Agents.* [arXiv:2503.18666](https://arxiv.org/abs/2503.18666)
 
-| Required section | Where |
-|---|---|
-| Problem and theme chosen | [The problem](#-the-problem) · [Abstract §1](assets/GroundGate_Abstract.pdf) |
-| Understanding of the challenge | [Why it is hard](#-why-it-is-hard) |
-| Proposed approach | [Architecture](#-architecture) |
-| Minimum viable | [MV mapping](#-what-the-minimum-viable-bar-maps-to) |
-| Stretch ambitions | [Stretch goals](#-what-the-minimum-viable-bar-maps-to) |
-| Novelty / differentiation | [Novelty](#-novelty-and-related-work) |
-| Evaluation plan | [Evaluation](#-evaluation) |
-| Feasibility and risks | [Roadmap](#-roadmap) · [Risks](#%EF%B8%8F-risks) |
-| Architecture diagram (optional, a plus) | `assets/architecture.jpeg` and the Mermaid diagrams above |
-
----
-
-## 📁 Repository contents
-
-```text
-GroundGate/
-├── README.md
-└── assets/
-    ├── GroundGate_Abstract.pdf    # Round 1 abstract
-    ├── architecture.jpeg          # system architecture (used in the abstract)
-    └── architecture_alt.png       # alternate architecture diagram
-```
-
----
-
-## 👥 Team
-
-**Neural Genesis** · Team ID `TM-1EFBCA97D27`
-
-| Role | Name |
-|---|---|
-| Team leader | Mouktika Jakkam |
-| Member | Dharmi Sandip Sapariya |
-
----
-
-## 📚 References
-
-arXiv 2607.07405 · 2606.20529 · 2610.11030 · 2507.16459 (EMNLP 2025 Industry) · 2610.31446 · 2608.04289 · AgentSpec 2503.18666 · Progent 2504.11703 · CaMeL 2503.18813
-
-<div align="center"><sub>All benchmark numbers in this repository come from synthetic worlds. Real-model results will be reported separately.</sub></div>
+<div align="center"><sub>All benchmark numbers in this repository come from synthetic worlds or hand-written scenarios. Real-model results will be reported separately, whatever they show.</sub></div>
