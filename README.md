@@ -10,7 +10,7 @@
 
 [**Try the playground**](docs/index.html) · [Architecture and flows](docs/ARCHITECTURE.md) · [Results](#results) · [Run it](#run-it) · [Agent harness](#langgraph-agent-harness) · [Honest limits](#what-is-not-done) · [Roadmap](#roadmap)
 
-<img src="docs/assets/architecture.png" alt="GroundGate architecture: untrusted agent, trusted gate and executor, cache, system of record, audit log" width="470">
+
 
 </div>
 
