@@ -15,7 +15,7 @@
 
 [Abstract (PDF)](assets/GroundGate_Abstract.pdf) · [The problem](#-the-problem) · [Architecture](#-architecture) · [Evaluation](#-evaluation) · [Roadmap](#-roadmap) · [Round 1 checklist](#-round-1-checklist)
 
-<img src="assets/architecture.jpeg" alt="GroundGate system architecture" width="900">
+<img src="https://github.com/DharmiSapariya/GroundGate/blob/main/GroundGate-System%20Architecture.jpeg" alt="GroundGate system architecture" width="900">
 
 </div>
 
